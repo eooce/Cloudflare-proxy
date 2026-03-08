@@ -201,7 +201,7 @@ function rightRotate(value, amount) {
 export default {
 	/**
 	 * @param {import("@cloudflare/workers-types").Request} request
-	 * @param {{UUID: string, uuid: string, PROXYIP: string, PASSWORD: string, PASSWD: string, password: string, proxyip: string, proxyIP: string, SUB_PATH: string, subpath: string, DISABLE_TROJAN: string, CLOSE_TROJAN: string}} env
+	 * @param {{KV: KVNamespace, UUID: string, uuid: string, PROXYIP: string, PASSWORD: string, PASSWD: string, password: string, proxyip: string, proxyIP: string, SUB_PATH: string, subpath: string, DISABLE_TROJAN: string, CLOSE_TROJAN: string}} env
 	 * @param {import("@cloudflare/workers-types").ExecutionContext} ctx
 	 * @returns {Promise<Response>}
 	 */
@@ -221,9 +221,48 @@ export default {
             yourUUID = env.UUID || env.uuid || yourUUID;
             disabletro = env.DISABLE_TROJAN || env.CLOSE_TROJAN || disabletro;
             
+            // KV加载当前优选IP列表和ProxyIP
+            let currentCfip = cfip;
+            let currentProxyIP = proxyIP;
+            if (env.KV) {
+                try {
+                    const kvCfip = await env.KV.get('CFIP_LIST');
+                    if (kvCfip) {
+                        currentCfip = kvCfip.split('\n').map(s => s.trim()).filter(s => s !== '');
+                    }
+                    const kvProxyIP = await env.KV.get('PROXY_IP');
+                    if (kvProxyIP !== null) {
+                        currentProxyIP = kvProxyIP;
+                    }
+                } catch (err) {}
+            }
+            // 应用加载后的ProxyIP
+            proxyIP = currentProxyIP;
+
             const url = new URL(request.url);
             const pathname = url.pathname;
             
+            // 拦截API请求保存配置
+            if (request.method === 'POST') {
+                if (pathname === '/update_cfip' || pathname === '/update_proxyip') {
+                    const reqPassword = url.searchParams.get('password');
+                    if (reqPassword !== password) return new Response('Unauthorized', { status: 401 });
+                    if (!env.KV) return new Response('KV namespace not bound', { status: 500 });
+                    try {
+                        if (pathname === '/update_cfip') {
+                            const newCfip = await request.text();
+                            await env.KV.put('CFIP_LIST', newCfip);
+                        } else if (pathname === '/update_proxyip') {
+                            const newProxyIP = await request.text();
+                            await env.KV.put('PROXY_IP', newProxyIP.trim());
+                        }
+                        return new Response('Success', { status: 200 });
+                    } catch (err) {
+                        return new Response('Error saving to KV: ' + err.message, { status: 500 });
+                    }
+                }
+            }
+
             let pathProxyIP = null;
             if (pathname.startsWith('/proxyip=')) {
                 try {
@@ -257,7 +296,7 @@ export default {
                 return await handleVlsRequest(request, customProxyIP);
             } else if (request.method === 'GET') {
                 if (url.pathname === '/') {
-                    return getHomePage(request);
+                    return getHomePage(request, currentCfip, currentProxyIP, password, !!env.KV);
                 }
                 
                 if (url.pathname.toLowerCase().includes(`/${subPath.toLowerCase()}`)) {
@@ -266,7 +305,7 @@ export default {
                     const troHeader = 't' + 'r' + 'o' + 'j' + 'a' + 'n';
                     
                     // 生成 VLE-SS 节点
-                    const vlsLinks = cfip.map(cdnItem => {
+                    const vlsLinks = currentCfip.map(cdnItem => {
                         let host, port = 443, nodeName = '';
                         if (cdnItem.includes('#')) {
                             const parts = cdnItem.split('#');
@@ -287,14 +326,15 @@ export default {
                             host = cdnItem;
                         }
                         
-                        const vlsNodeName = nodeName ? `${nodeName}-${vlsHeader}` : `Workers-${vlsHeader}`;
-                        return `${vlsHeader}://${yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${vlsNodeName}`;
+                        // 简化命名逻辑：直接使用备注（如有）或 Host/IP，去除多余的后缀
+                        const finalNodeName = nodeName ? nodeName : host;
+                        return `${vlsHeader}://${yourUUID}@${host}:${port}?encryption=none&security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${encodeURIComponent(finalNodeName)}`;
                     });
                     
                     // 生成 Tro-jan 节点
                     let allLinks = [...vlsLinks];
                     if (!disabletro) {
-                        const troLinks = cfip.map(cdnItem => {
+                        const troLinks = currentCfip.map(cdnItem => {
                             let host, port = 443, nodeName = '';
                             if (cdnItem.includes('#')) {
                                 const parts = cdnItem.split('#');
@@ -315,8 +355,9 @@ export default {
                                 host = cdnItem;
                             }
                             
-                            const troNodeName = nodeName ? `${nodeName}-${troHeader}` : `Workers-${troHeader}`;
-                            return `${troHeader}://${yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${troNodeName}`;
+                            // 简化命名逻辑：直接使用备注（如有）或 Host/IP，去除多余的后缀
+                            const finalNodeName = nodeName ? nodeName : host;
+                            return `${troHeader}://${yourUUID}@${host}:${port}?security=tls&sni=${currentDomain}&fp=firefox&allowInsecure=0&type=ws&host=${currentDomain}&path=%2F%3Fed%3D2560#${encodeURIComponent(finalNodeName)}`;
                         });
                         allLinks = [...vlsLinks, ...troLinks];
                     }
@@ -655,6 +696,9 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
         connectStreams(newSocket, ws, respHeader, null);
     }
     
+    // proxyConfig为空(直连)则不会使用代理
+    if (proxyIP === '' && !customProxyIP) shouldUseProxy = false;
+    
     if (shouldUseProxy) {
         try {
             await connecttoPry();
@@ -667,6 +711,8 @@ async function forwardataTCP(host, portNum, rawData, ws, respHeader, remoteConnW
             remoteConnWrapper.socket = initialSocket;
             connectStreams(initialSocket, ws, respHeader, connecttoPry);
         } catch (err) {
+            // 如果proxyIP为空则直连失败不重试代理
+            if (proxyIP === '' && !customProxyIP) throw err;
             await connecttoPry();
         }
     }
@@ -791,14 +837,14 @@ async function forwardataudp(udpChunk, webSocket, respHeader) {
  * @param {import("@cloudflare/workers-types").Request} request
  * @returns {Response}
  */
-function getHomePage(request) {
+function getHomePage(request, currentCfip, currentProxyIP, password, kvEnabled) {
 	const url = request.headers.get('Host');
 	const baseUrl = `https://${url}`;
 	const urlObj = new URL(request.url);
 	const providedPassword = urlObj.searchParams.get('password');
 	if (providedPassword) {
 		if (providedPassword === password) {
-			return getMainPageContent(url, baseUrl);
+			return getMainPageContent(url, baseUrl, currentCfip, currentProxyIP, kvEnabled);
 		} else {
 			return getLoginPage(url, baseUrl, true);
 		}
@@ -891,6 +937,7 @@ function getLoginPage(url, baseUrl, showError = false) {
             font-size: 1rem;
             transition: border-color 0.3s ease;
             background: #fff;
+            font-family: inherit;
         }
         
         .form-input:focus {
@@ -1003,7 +1050,9 @@ function getLoginPage(url, baseUrl, showError = false) {
  * @param {string} baseUrl 
  * @returns {Response}
  */
-function getMainPageContent(url, baseUrl) {
+function getMainPageContent(url, baseUrl, currentCfip, currentProxyIP, kvEnabled) {
+    const cfipListStr = encodeURIComponent(currentCfip.join('\n'));
+
 	const html = `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -1123,6 +1172,7 @@ function getMainPageContent(url, baseUrl) {
         .label {
             font-weight: 600;
             color: #4a5568;
+            flex-shrink: 0;
         }
         
         .value {
@@ -1132,6 +1182,9 @@ function getMainPageContent(url, baseUrl) {
             padding: 4px 8px;
             border-radius: 6px;
             font-size: 0.8rem;
+            word-break: break-all;
+            text-align: right;
+            margin-left: 10px;
         }
         
         .button-group {
@@ -1270,6 +1323,97 @@ function getMainPageContent(url, baseUrl) {
             font-weight: 500;
         }
         
+        /* 弹窗及输入框UI样式 */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            background: rgba(0, 0, 0, 0.4);
+            backdrop-filter: blur(4px);
+            z-index: 1001;
+            align-items: center;
+            justify-content: center;
+            opacity: 0;
+            transition: opacity 0.3s ease;
+        }
+        
+        .modal.show {
+            opacity: 1;
+        }
+        
+        .modal-content {
+            background: rgba(255, 255, 255, 0.95);
+            border-radius: 16px;
+            padding: 24px;
+            width: 90%;
+            max-width: 500px;
+            box-shadow: 0 20px 40px rgba(0, 0, 0, 0.2);
+            transform: translateY(-20px);
+            transition: transform 0.3s ease;
+            text-align: left;
+        }
+        
+        .modal.show .modal-content {
+            transform: translateY(0);
+        }
+        
+        .modal h3 {
+            margin-bottom: 8px;
+            color: #2d3748;
+        }
+        
+        .modal p {
+            color: #718096;
+            font-size: 0.9rem;
+            margin-bottom: 16px;
+            line-height: 1.5;
+        }
+
+        .form-input {
+            width: 100%;
+            padding: 12px 16px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 1rem;
+            transition: border-color 0.3s ease;
+            background: #fff;
+            font-family: inherit;
+        }
+
+        .form-input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .modal textarea {
+            width: 100%;
+            padding: 12px;
+            border: 2px solid #e2e8f0;
+            border-radius: 8px;
+            font-size: 0.9rem;
+            font-family: 'Courier New', monospace;
+            resize: vertical;
+            outline: none;
+            transition: border-color 0.3s ease;
+            white-space: pre;
+        }
+        
+        .modal textarea:focus {
+            border-color: #667eea;
+            box-shadow: 0 0 0 3px rgba(102, 126, 234, 0.1);
+        }
+        
+        .modal-actions {
+            display: flex;
+            justify-content: flex-end;
+            gap: 12px;
+            margin-top: 20px;
+        }
+
         @media (max-width: 768px) {
             .container {
                 padding: 15px;
@@ -1312,8 +1456,8 @@ function getMainPageContent(url, baseUrl) {
             }
             
             .value {
-                word-break: break-all;
-                font-size: 0.8rem;
+                text-align: left;
+                margin-left: 0;
             }
             
             .footer-links {
@@ -1363,6 +1507,10 @@ function getMainPageContent(url, baseUrl) {
                 <span class="value"><span class="status"></span>运行中</span>
             </div>
             <div class="info-item">
+                <span class="label">Proxy IP</span>
+                <span class="value">${currentProxyIP || '未设置 (不使用代理/直连)'}</span>
+            </div>
+            <div class="info-item">
                 <span class="label">主机地址</span>
                 <span class="value">${url}</span>
             </div>
@@ -1385,6 +1533,8 @@ function getMainPageContent(url, baseUrl) {
         </div>
         
         <div class="button-group">
+            <button onclick="showManageProxyIpModal()" class="btn btn-secondary">修改proxyip</button>
+            <button onclick="showManageIpModal()" class="btn btn-secondary">管理优选ip</button>
             <button onclick="copySingboxSubscription()" class="btn btn-secondary">复制singbox订阅链接</button>
             <button onclick="copyClashSubscription()" class="btn btn-secondary">复制Clash订阅链接</button>
             <button onclick="copySubscription()" class="btn btn-secondary">复制V2rayN订阅链接</button>
@@ -1410,6 +1560,32 @@ function getMainPageContent(url, baseUrl) {
         </div>
     </div>
     
+    <!-- 管理优选IP的弹窗 -->
+    <div id="manageIpModal" class="modal">
+        <div class="modal-content">
+            <h3>管理优选 IP</h3>
+            <p>每行一个，格式：优选域名:端口#备注 或 优选IP:端口#备注</p>
+            <textarea id="ipListInput" rows="10"></textarea>
+            <div class="modal-actions">
+                <button onclick="hideManageIpModal()" class="btn btn-secondary" style="min-width:auto;">取消</button>
+                <button id="saveIpBtn" onclick="saveIpList()" class="btn btn-primary" style="min-width:auto;">保存配置</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 修改 Proxy IP 的弹窗 -->
+    <div id="manageProxyIpModal" class="modal">
+        <div class="modal-content">
+            <h3>修改全局 Proxy IP</h3>
+            <p>支持格式：域名、IP:端口、socks5://、http:// 等。<br>清空输入框并保存则表示不使用代理（直连）。</p>
+            <input type="text" id="proxyIpInput" class="form-input" style="margin-bottom: 15px;" placeholder="例如: proxy.example.com:50001" />
+            <div class="modal-actions">
+                <button onclick="hideManageProxyIpModal()" class="btn btn-secondary" style="min-width:auto;">取消</button>
+                <button id="saveProxyIpBtn" onclick="saveProxyIp()" class="btn btn-primary" style="min-width:auto;">保存配置</button>
+            </div>
+        </div>
+    </div>
+
     <script>
         function showToast(message) {
             const existingToast = document.querySelector('.toast');
@@ -1498,6 +1674,100 @@ function getMainPageContent(url, baseUrl) {
                 currentUrl.searchParams.delete('password');
                 window.location.href = currentUrl.toString();
             }
+        }
+        
+        // --- 管理优选IP ---
+        function showManageIpModal() {
+            const modal = document.getElementById('manageIpModal');
+            modal.style.display = 'flex';
+            setTimeout(() => modal.classList.add('show'), 10);
+        }
+        function hideManageIpModal() {
+            const modal = document.getElementById('manageIpModal');
+            modal.classList.remove('show');
+            setTimeout(() => { modal.style.display = 'none'; }, 300);
+        }
+        async function saveIpList() {
+            if (!${kvEnabled ? 'true' : 'false'}) {
+                alert('未配置 KV 命名空间！请在 Cloudflare Worker 设置中绑定变量名称为 KV 的命名空间后再保存。');
+                return;
+            }
+            const btn = document.getElementById('saveIpBtn');
+            const originalText = btn.innerText;
+            btn.innerText = '保存中...';
+            btn.disabled = true;
+            
+            const newList = document.getElementById('ipListInput').value;
+            const currentUrl = new URL(window.location);
+            const pwd = currentUrl.searchParams.get('password');
+            
+            try {
+                const res = await fetch('/update_cfip?password=' + encodeURIComponent(pwd), { method: 'POST', body: newList });
+                if (res.ok) {
+                    showToast('优选 IP 列表保存成功！');
+                    hideManageIpModal();
+                    setTimeout(() => window.location.reload(), 1500);
+                } else {
+                    alert('保存失败: ' + await res.text());
+                }
+            } catch(e) {
+                alert('网络或请求出错: ' + e.message);
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+        }
+        
+        // --- 修改 Proxy IP ---
+        function showManageProxyIpModal() {
+            const modal = document.getElementById('manageProxyIpModal');
+            modal.style.display = 'flex';
+            setTimeout(() => modal.classList.add('show'), 10);
+        }
+        function hideManageProxyIpModal() {
+            const modal = document.getElementById('manageProxyIpModal');
+            modal.classList.remove('show');
+            setTimeout(() => { modal.style.display = 'none'; }, 300);
+        }
+        async function saveProxyIp() {
+            if (!${kvEnabled ? 'true' : 'false'}) {
+                alert('未配置 KV 命名空间！请在 Cloudflare Worker 设置中绑定变量名称为 KV 的命名空间后再保存。');
+                return;
+            }
+            const btn = document.getElementById('saveProxyIpBtn');
+            const originalText = btn.innerText;
+            btn.innerText = '保存中...';
+            btn.disabled = true;
+            
+            const newProxyIp = document.getElementById('proxyIpInput').value;
+            const currentUrl = new URL(window.location);
+            const pwd = currentUrl.searchParams.get('password');
+            
+            try {
+                const res = await fetch('/update_proxyip?password=' + encodeURIComponent(pwd), { method: 'POST', body: newProxyIp });
+                if (res.ok) {
+                    showToast('Proxy IP 保存成功！');
+                    hideManageProxyIpModal();
+                    setTimeout(() => window.location.reload(), 1500);
+                } else {
+                    alert('保存失败: ' + await res.text());
+                }
+            } catch(e) {
+                alert('网络或请求出错: ' + e.message);
+            } finally {
+                btn.innerText = originalText;
+                btn.disabled = false;
+            }
+        }
+        
+        // 自动注入当前生效的列表和代理IP
+        const ipInput = document.getElementById('ipListInput');
+        if(ipInput) {
+            ipInput.value = decodeURIComponent("${cfipListStr}");
+        }
+        const proxyInput = document.getElementById('proxyIpInput');
+        if(proxyInput) {
+            proxyInput.value = decodeURIComponent("${encodeURIComponent(currentProxyIP || '')}");
         }
     </script>
 </body>
