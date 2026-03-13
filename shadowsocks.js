@@ -1,16 +1,11 @@
 // 如需要使用环境变量,将462至468行取消注释
 import { connect } from 'cloudflare:sockets';
 
-let subPath = 'link';     // 节点订阅路径,不修改将使用UUID作为订阅路径
-let proxyIP = 'proxy.xxxxxxxx.tk:50001';  // proxyIP 格式：ip、域名、ip:port、域名:port等,没填写port，默认使用443,也可以是socks5
-let password = '5dc15e15-f285-4a9d-959b-0e4fbdd77b63';  // 节点UUID
+let subPath = '';     // 节点订阅路径,不修改将使用UUID作为订阅路径
+let proxyIP = '';  // proxyIP 格式：ip、域名、ip:port、域名:port等,没填写port，默认使用443,也可以是socks5
+let password = '';  // 节点UUID
 let SSpath = '';          // 路径验证，为空则使用UUID作为验证路径
 
-// CF-CDN 
-let cfip = [ // 格式:优选域名:端口#备注名称、优选IP:端口#备注名称、[ipv6优选]:端口#备注名称、优选域名#备注 
-    'mfa.gov.ua#SG', 'saas.sin.fan#JP', 'store.ubi.com#SG','cf.130519.xyz#KR','cf.008500.xyz#HK', 
-    'cf.090227.xyz#SG', 'cf.877774.xyz#HK','cdns.doon.eu.org#JP','sub.danfeng.eu.org#TW','cf.zhetengsha.eu.org#HK'
-];  // 感谢各位大佬维护的优选域名
 
 function closeSocketQuietly(socket) {
     try { 
@@ -127,10 +122,6 @@ async function handleSSRequest(request, customProxyIP) {
 
             if (isSpeedTestSite(hostname)) {
                 throw new Error('Speedtest site is blocked');
-            }
-            if (addressType === 2) { 
-                if (port === 53) isDnsQuery = true;
-                else throw new Error('UDP is not supported');
             }
             const rawData = chunk.slice(rawIndex);
             if (isDnsQuery) return forwardataudp(rawData, serverSock, null);
@@ -443,29 +434,10 @@ async function forwardataudp(udpChunk, webSocket, respHeader) {
     }
 }
 
-function getSimplePage(request) {
-    const url = request.headers.get('Host');
-    const baseUrl = `https://${url}`;
-    const html = `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0"><title>Shadowsocks Cloudflare Service</title><style>*{margin:0;padding:0;box-sizing:border-box;}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:linear-gradient(135deg,#7dd3ca 0%,#a17ec4 100%);height:100vh;display:flex;align-items:center;justify-content:center;color:#333;margin:0;padding:0;overflow:hidden;}.container{background:rgba(255,255,255,0.95);backdrop-filter:blur(10px);border-radius:20px;padding:40px;box-shadow:0 20px 40px rgba(0,0,0,0.1);max-width:800px;width:95%;text-align:center;}.logo{margin-bottom:-20px;}.title{font-size:2rem;margin-bottom:30px;color:#2d3748;}.tip-card{background:#fff3cd;border-radius:12px;padding:20px;margin:20px 0;text-align:center;border-left:4px solid #ffc107;}.tip-title{font-weight:600;color:#856404;margin-bottom:10px;}.tip-content{color:#856404;font-size:1rem;}.highlight{font-weight:bold;color:#000;background:#fff;padding:2px 6px;border-radius:4px;}@media (max-width:768px){.container{padding:20px;}}</style></head><body><div class="container"><div class="logo"><img src="https://img.icons8.com/color/96/cloudflare.png" alt="Logo" width="96" height="96"></div><h1 class="title">Hello shodowsocks！</h1><div class="tip-content">访问 <span class="highlight">${baseUrl}/你的UUID</span> 进入订阅中心</div></div></div></body></html>`;
-    return new Response(html, {
-        status: 200,
-        headers: {
-            'Content-Type': 'text/html;charset=utf-8',
-            'Cache-Control': 'no-cache, no-store, must-revalidate',
-        },
-    });
-}
 
 export default {
     async fetch(request,env) {
         try {
-            // if (env.PROXYIP || env.proxyip || env.proxyIP) {
-            //     const servers = (env.PROXYIP || env.proxyip || env.proxyIP).split(',').map(s => s.trim());
-            //     //proxyIP = servers[0]; 
-            // }
-            // password = env.PASSWORD || env.password || env.uuid || env.UUID || password;
-            // subPath = env.SUB_PATH || env.subpath || subPath;
-            // SSpath = env.SSPATH || env.sspath || SSpath;
             if (subPath === 'link' || subPath === '') { subPath = password; }
             if (SSpath === '') { SSpath = password; }
             let validPath = `/${SSpath}`; 
@@ -492,6 +464,7 @@ export default {
                 }
             }
 
+            
             if (request.headers.get('Upgrade') === 'websocket') {
                 if (!pathname.toLowerCase().startsWith(validPath.toLowerCase())) {
                     return new Response('Unauthorized', { status: 401 });
